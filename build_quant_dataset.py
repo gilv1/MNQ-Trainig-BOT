@@ -57,12 +57,17 @@ MACRO_SERIES = {
 }
 
 INTERVAL_RULES = {
-    # Límites de Yahoo Finance para evitar errores de rango:
-    # - 1m: máximo 8 días por petición
-    # - 5m: últimos 60 días
-    "1m": "7d",
-    "5m": "60d",
+    # Horizonte objetivo por intervalo.
+    # Para intervalos con límites de Yahoo (1m, 5m), se aplica ajuste/chunking automáticamente.
+    "1m": "30d",
+    "5m": "1y",
     "1d": "10y",
+}
+
+YF_INTERVAL_LIMITS_DAYS = {
+    # Máximo de días por request para evitar errores de yfinance.
+    "1m": 8,
+    "5m": 60,
 }
 
 
@@ -115,6 +120,9 @@ def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def fetch_yf(ticker: str, interval: str, period: str) -> pd.DataFrame:
+    if interval in YF_INTERVAL_LIMITS_DAYS:
+        return fetch_yf_with_limits(ticker=ticker, interval=interval, period=period)
+
     raw = yf.download(
         ticker,
         interval=interval,
@@ -124,6 +132,55 @@ def fetch_yf(ticker: str, interval: str, period: str) -> pd.DataFrame:
         threads=False,
     )
     return normalize_ohlcv(raw)
+
+
+def _period_to_days(period: str) -> int:
+    period = period.strip().lower()
+    if period.endswith("d"):
+        return int(period[:-1])
+    if period.endswith("y"):
+        return int(period[:-1]) * 365
+    raise ValueError(f"Periodo no soportado: {period}")
+
+
+def fetch_yf_with_limits(ticker: str, interval: str, period: str) -> pd.DataFrame:
+    requested_days = _period_to_days(period)
+    limit_days = YF_INTERVAL_LIMITS_DAYS[interval]
+
+    # En 5m Yahoo solo permite datos dentro de ~60 días recientes; no se puede reconstruir 1y.
+    if interval == "5m" and requested_days > limit_days:
+        requested_days = limit_days
+
+    end = pd.Timestamp.utcnow().floor("min")
+    start = end - pd.Timedelta(days=requested_days)
+
+    frames: list[pd.DataFrame] = []
+    chunk_days = limit_days - 1 if interval == "1m" else limit_days
+    chunk_start = start
+
+    while chunk_start < end:
+        chunk_end = min(chunk_start + pd.Timedelta(days=chunk_days), end)
+        raw = yf.download(
+            ticker,
+            interval=interval,
+            start=chunk_start.to_pydatetime(),
+            end=chunk_end.to_pydatetime(),
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+        norm = normalize_ohlcv(raw)
+        if not norm.empty:
+            frames.append(norm)
+        # Evita loop infinito por ventanas minúsculas
+        chunk_start = chunk_end + pd.Timedelta(minutes=1)
+
+    if not frames:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    out = pd.concat(frames, ignore_index=True)
+    out = out.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
+    return out
 
 
 def fetch_yf_safe(ticker: str, interval: str, period: str, label: str) -> pd.DataFrame:
