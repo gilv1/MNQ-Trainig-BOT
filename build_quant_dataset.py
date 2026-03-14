@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import json
 import os
 import sqlite3
 from dataclasses import dataclass
@@ -116,6 +117,25 @@ def resolve_fred_api_key(cli_value: str) -> str:
         return env_value
 
     return read_env_file_value(Path(".env"), "FRED_API_KEY")
+
+
+def resolve_finnhub_api_key(cli_value: str) -> str:
+    """Resuelve la API key de Finnhub desde CLI, entorno o `.env` local."""
+    if cli_value:
+        return strip_wrapping_quotes(cli_value)
+
+    # Compatibilidad para ambas variantes: FINNHUB_API_KEY y FINHUB_API_KEY.
+    for env_key in ("FINNHUB_API_KEY", "FINHUB_API_KEY"):
+        env_value = strip_wrapping_quotes(os.getenv(env_key, ""))
+        if env_value:
+            return env_value
+
+    for file_key in ("FINNHUB_API_KEY", "FINHUB_API_KEY"):
+        file_value = read_env_file_value(Path(".env"), file_key)
+        if file_value:
+            return file_value
+
+    return ""
 
 
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
@@ -388,7 +408,47 @@ def fetch_fred_series(api_key: str, macro_dir: Path) -> Dict[str, pd.DataFrame]:
     return out
 
 
-def build_dataset(output_dir: Path, fred_api_key: Optional[str]) -> None:
+def fetch_finnhub_series(api_key: str, macro_dir: Path) -> Dict[str, pd.DataFrame]:
+    """Descarga series macro desde Finnhub usando los códigos FRED."""
+    out: Dict[str, pd.DataFrame] = {}
+
+    if not api_key:
+        print("[WARN] FINNHUB_API_KEY no configurada; se omiten series macro en Finnhub.")
+        return out
+
+    for name, code in MACRO_SERIES.items():
+        url = "https://finnhub.io/api/v1/economic"
+        try:
+            resp = requests.get(url, params={"code": code, "token": api_key}, timeout=30)
+            resp.raise_for_status()
+            payload = resp.json()
+
+            data = payload.get("data", []) if isinstance(payload, dict) else []
+            if not data:
+                print(f"[WARN] Finnhub sin datos para {name} ({code}).")
+                continue
+
+            df = pd.DataFrame(data)
+            if "date" not in df.columns or "value" not in df.columns:
+                print(f"[WARN] Finnhub devolvió formato no esperado para {name} ({code}).")
+                continue
+
+            df = df.rename(columns={"date": "timestamp"})[["timestamp", "value"]]
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+            df = df.dropna(subset=["timestamp", "value"]).drop_duplicates(subset=["timestamp"], keep="last")
+            df = df.sort_values("timestamp").reset_index(drop=True)
+
+            save_csv(df, macro_dir / f"{name}.csv")
+            out[f"macro_{name.lower()}"] = df
+            print(f"[OK] Macro guardado con Finnhub: {name}")
+        except (requests.RequestException, json.JSONDecodeError) as exc:
+            print(f"[WARN] No se pudo descargar {name} ({code}) en Finnhub: {exc}")
+
+    return out
+
+
+def build_dataset(output_dir: Path, fred_api_key: Optional[str], finnhub_api_key: Optional[str]) -> None:
     data_dir, macro_dir = ensure_dirs(output_dir)
 
     sqlite_frames: Dict[str, pd.DataFrame] = {}
@@ -468,7 +528,12 @@ def build_dataset(output_dir: Path, fred_api_key: Optional[str]) -> None:
 
     print("Descargando macro (FRED)...")
     fred_frames = fetch_fred_series(fred_api_key or "", macro_dir)
-    sqlite_frames.update(fred_frames)
+    if fred_frames:
+        sqlite_frames.update(fred_frames)
+    else:
+        print("Descargando macro (Finnhub)...")
+        finnhub_frames = fetch_finnhub_series(finnhub_api_key or "", macro_dir)
+        sqlite_frames.update(finnhub_frames)
 
     if intraday_signals:
         intraday = pd.concat(intraday_signals, ignore_index=True)
@@ -500,13 +565,19 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="API key de FRED (prioridad: CLI > FRED_API_KEY > .env)",
     )
+    parser.add_argument(
+        "--finnhub-api-key",
+        default="",
+        help="API key de Finnhub (prioridad: CLI > FINNHUB_API_KEY > .env)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     fred_api_key = resolve_fred_api_key(args.fred_api_key)
-    build_dataset(output_dir=args.output_dir, fred_api_key=fred_api_key)
+    finnhub_api_key = resolve_finnhub_api_key(args.finnhub_api_key)
+    build_dataset(output_dir=args.output_dir, fred_api_key=fred_api_key, finnhub_api_key=finnhub_api_key)
 
 
 if __name__ == "__main__":
