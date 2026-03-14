@@ -25,6 +25,7 @@ from typing import Dict, Optional
 import pandas as pd
 import requests
 import yfinance as yf
+from pandas.errors import EmptyDataError
 
 try:
     from fredapi import Fred
@@ -123,13 +124,10 @@ def fetch_yf(ticker: str, interval: str, period: str) -> pd.DataFrame:
     if interval in YF_INTERVAL_LIMITS_DAYS:
         return fetch_yf_with_limits(ticker=ticker, interval=interval, period=period)
 
-    raw = yf.download(
-        ticker,
+    raw = yf.Ticker(ticker).history(
         interval=interval,
         period=period,
         auto_adjust=False,
-        progress=False,
-        threads=False,
     )
     return normalize_ohlcv(raw)
 
@@ -147,8 +145,8 @@ def fetch_yf_with_limits(ticker: str, interval: str, period: str) -> pd.DataFram
     requested_days = _period_to_days(period)
     limit_days = YF_INTERVAL_LIMITS_DAYS[interval]
 
-    # En 5m Yahoo solo permite datos dentro de ~60 días recientes; no se puede reconstruir 1y.
-    if interval == "5m" and requested_days > limit_days:
+    # Yahoo limita 1m (~8 días) y 5m (~60 días) sobre ventana reciente.
+    if requested_days > limit_days:
         requested_days = limit_days
 
     end = pd.Timestamp.utcnow().floor("min")
@@ -160,14 +158,11 @@ def fetch_yf_with_limits(ticker: str, interval: str, period: str) -> pd.DataFram
 
     while chunk_start < end:
         chunk_end = min(chunk_start + pd.Timedelta(days=chunk_days), end)
-        raw = yf.download(
-            ticker,
+        raw = yf.Ticker(ticker).history(
             interval=interval,
             start=chunk_start.to_pydatetime(),
             end=chunk_end.to_pydatetime(),
             auto_adjust=False,
-            progress=False,
-            threads=False,
         )
         norm = normalize_ohlcv(raw)
         if not norm.empty:
@@ -188,7 +183,12 @@ def fetch_yf_safe(ticker: str, interval: str, period: str, label: str) -> pd.Dat
         df = fetch_yf(ticker, interval=interval, period=period)
     except Exception as exc:
         print(f"[WARN] {label}: error descargando {ticker} {interval}/{period}: {exc}")
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        # fallback adicional para tickers que fallan con download/history por lote
+        try:
+            alt = yf.Ticker(ticker).history(interval=interval, period=period, auto_adjust=False)
+            df = normalize_ohlcv(alt)
+        except Exception:
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
     if df.empty:
         print(f"[WARN] {label}: sin datos para {ticker} {interval}/{period}.")
@@ -203,7 +203,14 @@ def fetch_stooq_daily(symbol: str) -> pd.DataFrame:
     if not resp.text.strip():
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
-    out = pd.read_csv(io.StringIO(resp.text))
+    body = resp.text.strip()
+    if not body or "No data" in body:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    try:
+        out = pd.read_csv(io.StringIO(body))
+    except EmptyDataError:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
     if out.empty:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
