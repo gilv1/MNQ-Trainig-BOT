@@ -15,6 +15,7 @@ Fuentes:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import os
 import sqlite3
@@ -124,12 +125,35 @@ def fetch_yf(ticker: str, interval: str, period: str) -> pd.DataFrame:
     if interval in YF_INTERVAL_LIMITS_DAYS:
         return fetch_yf_with_limits(ticker=ticker, interval=interval, period=period)
 
-    raw = yf.Ticker(ticker).history(
+    raw = run_yf_history_quiet(
+        ticker=ticker,
         interval=interval,
         period=period,
-        auto_adjust=False,
     )
     return normalize_ohlcv(raw)
+
+
+def run_yf_history_quiet(
+    ticker: str,
+    interval: str,
+    period: str | None = None,
+    start: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Ejecuta yfinance.history silenciando warnings ruidosos en consola."""
+    kwargs = {
+        "interval": interval,
+        "auto_adjust": False,
+    }
+    if period is not None:
+        kwargs["period"] = period
+    if start is not None:
+        kwargs["start"] = start.to_pydatetime()
+    if end is not None:
+        kwargs["end"] = end.to_pydatetime()
+
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        return yf.Ticker(ticker).history(**kwargs)
 
 
 def _period_to_days(period: str) -> int:
@@ -158,11 +182,11 @@ def fetch_yf_with_limits(ticker: str, interval: str, period: str) -> pd.DataFram
 
     while chunk_start < end:
         chunk_end = min(chunk_start + pd.Timedelta(days=chunk_days), end)
-        raw = yf.Ticker(ticker).history(
+        raw = run_yf_history_quiet(
+            ticker=ticker,
             interval=interval,
-            start=chunk_start.to_pydatetime(),
-            end=chunk_end.to_pydatetime(),
-            auto_adjust=False,
+            start=chunk_start,
+            end=chunk_end,
         )
         norm = normalize_ohlcv(raw)
         if not norm.empty:
@@ -183,9 +207,13 @@ def fetch_yf_safe(ticker: str, interval: str, period: str, label: str) -> pd.Dat
         df = fetch_yf(ticker, interval=interval, period=period)
     except Exception as exc:
         print(f"[WARN] {label}: error descargando {ticker} {interval}/{period}: {exc}")
-        # fallback adicional para tickers que fallan con download/history por lote
+        # fallback adicional para tickers que fallan con history por lote
         try:
-            alt = yf.Ticker(ticker).history(interval=interval, period=period, auto_adjust=False)
+            if interval in YF_INTERVAL_LIMITS_DAYS:
+                alt = fetch_yf_with_limits(ticker=ticker, interval=interval, period=period)
+                return normalize_ohlcv(alt)
+
+            alt = run_yf_history_quiet(ticker=ticker, interval=interval, period=period)
             df = normalize_ohlcv(alt)
         except Exception:
             return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -356,7 +384,10 @@ def build_dataset(output_dir: Path, fred_api_key: Optional[str]) -> None:
                     if not sig.empty:
                         intraday_signals.append(sig)
 
-                print(f"[OK] {contract.name} {interval} ({period}) -> {file_name}")
+                if df.empty:
+                    print(f"[WARN] {contract.name} {interval} ({period}) sin datos -> {file_name}")
+                else:
+                    print(f"[OK] {contract.name} {interval} ({period}) {len(df):,} filas -> {file_name}")
             except Exception as exc:
                 print(f"[WARN] Error en {contract.name} {interval}: {exc}")
 
