@@ -83,6 +83,41 @@ def ensure_dirs(base_dir: Path) -> tuple[Path, Path]:
     return base_dir, macro_dir
 
 
+def strip_wrapping_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1].strip()
+    return value
+
+
+def read_env_file_value(path: Path, key: str) -> str:
+    if not path.exists() or not path.is_file():
+        return ""
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        found_key, _, found_value = line.partition("=")
+        if found_key.strip() == key:
+            return strip_wrapping_quotes(found_value)
+
+    return ""
+
+
+def resolve_fred_api_key(cli_value: str) -> str:
+    """Resuelve la API key de FRED desde CLI, entorno o `.env` local."""
+    if cli_value:
+        return strip_wrapping_quotes(cli_value)
+
+    env_value = strip_wrapping_quotes(os.getenv("FRED_API_KEY", ""))
+    if env_value:
+        return env_value
+
+    return read_env_file_value(Path(".env"), "FRED_API_KEY")
+
+
 def normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -462,15 +497,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--fred-api-key",
-        default=os.getenv("FRED_API_KEY", ""),
-        help="API key de FRED (default: variable FRED_API_KEY)",
+        default="",
+        help="API key de FRED (prioridad: CLI > FRED_API_KEY > .env)",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    build_dataset(output_dir=args.output_dir, fred_api_key=args.fred_api_key)
+    fred_api_key = resolve_fred_api_key(args.fred_api_key)
+    build_dataset(output_dir=args.output_dir, fred_api_key=fred_api_key)
 
 
 if __name__ == "__main__":
