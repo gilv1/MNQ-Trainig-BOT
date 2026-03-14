@@ -57,8 +57,11 @@ MACRO_SERIES = {
 }
 
 INTERVAL_RULES = {
-    "1m": "30d",
-    "5m": "1y",
+    # Límites de Yahoo Finance para evitar errores de rango:
+    # - 1m: máximo 8 días por petición
+    # - 5m: últimos 60 días
+    "1m": "7d",
+    "5m": "60d",
     "1d": "10y",
 }
 
@@ -123,11 +126,26 @@ def fetch_yf(ticker: str, interval: str, period: str) -> pd.DataFrame:
     return normalize_ohlcv(raw)
 
 
+def fetch_yf_safe(ticker: str, interval: str, period: str, label: str) -> pd.DataFrame:
+    try:
+        df = fetch_yf(ticker, interval=interval, period=period)
+    except Exception as exc:
+        print(f"[WARN] {label}: error descargando {ticker} {interval}/{period}: {exc}")
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    if df.empty:
+        print(f"[WARN] {label}: sin datos para {ticker} {interval}/{period}.")
+    return df
+
+
 def fetch_stooq_daily(symbol: str) -> pd.DataFrame:
     # Stooq CSV endpoint: d1 = diario
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
     resp = requests.get(url, timeout=30)
     resp.raise_for_status()
+    if not resp.text.strip():
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
     out = pd.read_csv(io.StringIO(resp.text))
     if out.empty:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -254,7 +272,12 @@ def build_dataset(output_dir: Path, fred_api_key: Optional[str]) -> None:
     for contract in CONTRACTS:
         for interval, period in INTERVAL_RULES.items():
             try:
-                df = fetch_yf(contract.yahoo_ticker, interval=interval, period=period)
+                df = fetch_yf_safe(
+                    contract.yahoo_ticker,
+                    interval=interval,
+                    period=period,
+                    label=contract.name,
+                )
                 suffix = "daily" if interval == "1d" else interval
                 file_name = f"{contract.name}_{suffix}.csv"
                 save_csv(df, data_dir / file_name)
@@ -306,8 +329,8 @@ def build_dataset(output_dir: Path, fred_api_key: Optional[str]) -> None:
             print(f"[WARN] No se pudo descargar Stooq {contract.name}: {exc}")
 
     print("Descargando VIX y DXY...")
-    vix = fetch_yf("^VIX", interval="1d", period="10y")
-    dxy = fetch_yf("DX-Y.NYB", interval="1d", period="10y")
+    vix = fetch_yf_safe("^VIX", interval="1d", period="10y", label="VIX")
+    dxy = fetch_yf_safe("DX-Y.NYB", interval="1d", period="10y", label="DXY")
     save_csv(vix, data_dir / "VIX.csv")
     save_csv(dxy, data_dir / "DXY.csv")
     sqlite_frames["vix_daily"] = vix
